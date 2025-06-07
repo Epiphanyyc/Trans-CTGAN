@@ -1,0 +1,265 @@
+
+#判别器
+
+class TransformerEncoderLayerCustom(TransformerEncoderLayer):
+    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1):
+        super(TransformerEncoderLayerCustom, self).__init__(d_model, nhead, dim_feedforward, dropout)
+
+class MultiEncoderDiscriminator(nn.Module):
+    def __init__(self, input_dim, num_encoders, encoder_layers, encoder_d_model, encoder_nhead, encoder_dim_feedforward, final_dim, pac=10):
+        super(MultiEncoderDiscriminator, self).__init__()
+        self.pac = pac
+        self.pacdim = input_dim * pac
+        
+        # 嵌入层（这里实际上没有使用额外的嵌入，因为输入已经是正确的维度）
+        # 如果需要，可以在这里添加额外的嵌入逻辑
+        
+        # 定义多个Transformer Encoder
+        self.encoders = nn.ModuleList([
+            TransformerEncoder(TransformerEncoderLayerCustom(encoder_d_model, encoder_nhead, encoder_dim_feedforward, dropout=0.1), num_layers=encoder_layers)
+            for _ in range(num_encoders)
+        ])
+        
+        # 由于每个encoder的输出维度与输入维度相同（即encoder_d_model），
+        # 我们需要一个线性层来将它们的输出合并，并映射到final_dim
+        self.encoder_output_dim = encoder_d_model * num_encoders
+        self.fc_merge = Linear(self.encoder_output_dim, final_dim)
+        
+        # 最后的输出层，将final_dim映射到1（因为是二分类任务）
+        self.output_layer = Linear(final_dim, 1)
+        
+        # 激活函数（LeakyReLU）和Dropout层可以在合并后的线性层之后应用，
+        # 但为了保持与原始结构相似，我们在这里不添加它们，而是在forward方法中处理。
+        
+    def forward(self, input_):
+        # 假设input_的维度是(batch_size, input_dim * pac)
+        # 由于我们处理的是表格数据，所以不需要添加位置嵌入
+        # 将输入视图为(batch_size // pac, pac, input_dim)以模拟sequence长度（这里pac作为sequence长度的模拟）
+        # 但由于Transformer实际上处理的是(sequence_length, batch_size, d_model)的形状，
+        # 我们需要再次转置以匹配这个形状
+        input_reshaped = input_.view(input_.size(0) // self.pac, self.pac, self.pacdim).permute(1, 0, 2)  # (pac, batch_size // pac, input_dim * pac)
+        
+        # 初始化一个列表来存储每个encoder的输出
+        encoder_outputs = []
+        
+        # 遍历每个encoder并处理输入
+        for encoder in self.encoders:
+            output = encoder(input_reshaped)  # (sequence_length, batch_size, encoder_d_model)
+            # 我们只关心最后一个时间步的输出（因为对于分类任务，我们通常只使用序列的最终表示）
+            encoder_output = output[-1, :, :]  # (batch_size // pac, encoder_d_model)
+            encoder_outputs.append(encoder_output)
+        
+        # 将所有encoder的输出在batch维度上堆叠，然后在最后一个维度上展平
+        # 由于我们模拟了sequence长度，所以这里需要先将batch维度合并回来
+        stacked_outputs = torch.stack(encoder_outputs, dim=1).view(input_.size(0), -1)  # (batch_size, encoder_d_model * num_encoders)
+        
+        # 通过线性层映射到final_dim
+        pre_out = self.fc_merge(stacked_outputs)  # (batch_size, final_dim)
+        
+        # 应用LeakyReLU激活函数和Dropout（如果需要）
+        # 这里为了与原始结构保持一致，我们添加LeakyReLU和Dropout
+        pre_out = nn.functional.leaky_relu(pre_out, negative_slope=0.2)
+        pre_out = nn.functional.dropout(pre_out, p=0.5, training=self.training)
+        
+        # 通过最后的输出层生成判别结果
+        output = self.output_layer(pre_out)  # (batch_size, 1)
+        
+        return output
+
+    def calc_gradient_penalty(self, real_data, fake_data, device='cpu', pac=10, lambda_=10):
+        """Compute the gradient penalty."""
+        alpha = torch.rand(real_data.size(0) // pac, 1, 1, device=device)
+        alpha = alpha.repeat(1, pac, real_data.size(1))
+        alpha = alpha.view(-1, real_data.size(1))
+
+        interpolates = alpha * real_data + ((1 - alpha) * fake_data)
+
+        disc_interpolates = self(interpolates)
+
+        gradients = torch.autograd.grad(
+            outputs=disc_interpolates,
+            inputs=interpolates,
+            grad_outputs=torch.ones(disc_interpolates.size(), device=device),
+            create_graph=True,
+            retain_graph=True,
+            only_inputs=True,
+        )[0]
+
+        gradients_view = gradients.view(-1, pac * real_data.size(1)).norm(2, dim=1) - 1
+        gradient_penalty = ((gradients_view) ** 2).mean() * lambda_
+
+        return gradient_penalty
+    # 注意：calc_gradient_penalty方法在这里没有修改，因为它依赖于原始输入数据的形状和判别器的输出，
+    # 并且与判别器的内部结构无关。只要输入输出形状保持一致，该方法就可以继续使用。
+    # ... (calc_gradient_penalty方法的代码保持不变)
+
+# 示例用法（假设参数已经定义）
+# input_dim = ...  # 输入数据的维度
+# num_encoders = ...  # Transformer Encoder的数量
+# encoder_layers = ... # 每个Transformer Encoder中的层数
+# encoder_d_model = ... # Transformer Encoder的模型维度（d_model）
+# encoder_nhead = ...   # Transformer Encoder中的多头注意力头数
+# encoder_dim_feedforward = ... # Transformer Encoder中的前馈网络维度
+# final_dim = ...       # 合并encoder输出后的维度（可以自由选择）
+# pac = ...             # 打包大小（packing size），用于模拟sequence长度
+# discriminator = MultiEncoderDiscriminator(input_dim, num_encoders, encoder_layers, encoder_d_model, encoder_nhead, encoder_dim_feedforward, final_dim, pac)
+# real_data = torch.randn(batch_size, input_dim * pac)  # 假设batch_size已经定义，且real_data的维度与判别器输入匹配
+# fake_data = torch.randn(batch_size, input_dim * pac)  # 假设fake_data的维度与real_data相同
+# output = discriminator(real_data)
+# gradient_penalty = discriminator.calc_gradient_penalty(real_data, fake_data)
+
+
+#生成器
+
+# 定义Transformer Encoder Layer（这里使用PyTorch内置的TransformerEncoderLayer）
+class TransformerEncoderLayerCustom(TransformerEncoderLayer):
+    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1):
+        super(TransformerEncoderLayerCustom, self).__init__(d_model, nhead, dim_feedforward, dropout)
+
+# 由于我们不需要对输入做位置嵌入，所以直接使用TransformerEncoder
+class MultiEncoderGenerator(nn.Module):
+    def __init__(self, embedding_dim, num_encoders, encoder_layers, encoder_d_model, encoder_nhead, encoder_dim_feedforward, final_dim, data_dim):
+        super(MultiEncoderGenerator, self).__init__()
+        # 嵌入层，将输入映射到encoder的d_model维度
+        print(f"hhhhhhhhhhhhhhhhhhhhhhhhhh-----------{embedding_dim}")
+        self.embedding = Linear(embedding_dim, encoder_d_model)
+        # 定义多个Transformer Encoder
+        self.encoders = nn.ModuleList([
+            TransformerEncoder(TransformerEncoderLayerCustom(encoder_d_model, encoder_nhead, encoder_dim_feedforward, dropout=0.1), num_layers=encoder_layers)
+            for _ in range(num_encoders)
+        ])
+        # 由于每个encoder的输出维度与输入维度相同（即encoder_d_model），我们需要一个线性层来将它们的输出合并
+        # 这里我们简单地将它们的输出相加，然后通过一个线性层映射到final_dim
+        self.encoder_output_dim = encoder_d_model * num_encoders
+        self.fc_merge = Linear(self.encoder_output_dim, final_dim)
+        # 最后的输出层，将final_dim映射到数据维度data_dim
+        self.output_layer = Linear(final_dim, data_dim)
+
+    def forward(self, input_):
+        # 假设input_的维度是(batch_size, embedding_dim)
+        # 将输入映射到encoder的d_model维度，并添加batch和sequence维度（这里假设sequence长度为1，因为处理的是表格数据）
+        embedded = self.embedding(input_).unsqueeze(1)  # (batch_size, 1, encoder_d_model)
+        # 初始化一个列表来存储每个encoder的输出
+        encoder_outputs = []
+        # 遍历每个encoder并处理输入
+        for encoder in self.encoders:
+            output = encoder(embedded)  # (batch_size, 1, encoder_d_model)
+            encoder_outputs.append(output.squeeze(1))  # (batch_size, encoder_d_model)，移除sequence维度
+        # 将所有encoder的输出在batch维度上堆叠，然后在最后一个维度上展平
+        # 由于我们假设sequence长度为1，所以这里直接堆叠即可
+        stacked_outputs = torch.stack(encoder_outputs, dim=1)  # (batch_size, num_encoders, encoder_d_model)
+        flat_outputs = stacked_outputs.view(stacked_outputs.size(0), -1)  # (batch_size, encoder_d_model * num_encoders)
+        # 通过线性层映射到final_dim
+        pre_out = self.fc_merge(flat_outputs)  # (batch_size, final_dim)
+        # 通过最后的输出层生成数据
+        output = self.output_layer(pre_out)  # (batch_size, data_dim)
+        return output
+
+# 示例用法（假设参数已经定义）
+# embedding_dim = ...  # 输入嵌入的维度
+# num_encoders = ...   # Transformer Encoder的数量
+# encoder_layers = ... # 每个Transformer Encoder中的层数
+# encoder_d_model = ... # Transformer Encoder的模型维度（d_model）
+# encoder_nhead = ...   # Transformer Encoder中的多头注意力头数
+# encoder_dim_feedforward = ... # Transformer Encoder中的前馈网络维度
+# final_dim = ...       # 合并encoder输出后的维度（可以自由选择）
+# data_dim = ...        # 生成数据的维度（与目标数据集的维度相匹配）
+# generator = MultiEncoderGenerator(embedding_dim, num_encoders, encoder_layers, encoder_d_model, encoder_nhead, encoder_dim_feedforward, final_dim, data_dim)
+# input_data = torch.randn(batch_size, embedding_dim)  # 假设batch_size已经定义
+# generated_data = generator(input_data)
+
+#  discriminator!!!!!!!!
+
+class TransformerDiscriminator(nn.Module):
+    """Discriminator for the CTGAN using Transformer Encoders."""
+
+    def __init__(self, input_dim, transformer_dim, num_transformer_layers, final_nn_dim, pac=10, dropout=0.1):
+        super(TransformerDiscriminator, self).__init__()
+        self.pac = pac
+        self.pacdim = input_dim * pac
+        
+        # Transformer encoder setup
+        d_model = transformer_dim
+        nhead = 2  # Number of heads for multi-head attention
+        num_layers = num_transformer_layers
+        
+        encoder_layers = TransformerEncoderLayer(d_model, nhead, dim_feedforward=d_model * 4, dropout=dropout)
+        self.transformer_encoder = TransformerEncoder(encoder_layers, num_layers=num_layers)
+        
+        # Final neural network setup
+        self.final_nn = nn.Sequential(
+            nn.Linear(d_model, final_nn_dim),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(0.5),
+            nn.Linear(final_nn_dim, 1)
+        )
+
+    def calc_gradient_penalty(self, real_data, fake_data, device='cpu', lambda_=10):
+        """Compute the gradient penalty (unchanged from the original code)."""
+        alpha = torch.rand(real_data.size(0) // self.pac, 1, 1, device=device)
+        alpha = alpha.repeat(1, self.pac, real_data.size(1))
+        alpha = alpha.view(-1, real_data.size(1))
+
+        interpolates = alpha * real_data + ((1 - alpha) * fake_data)
+
+        disc_interpolates = self(interpolates)
+
+        gradients = torch.autograd.grad(
+            outputs=disc_interpolates,
+            inputs=interpolates,
+            grad_outputs=torch.ones(disc_interpolates.size(), device=device),
+            create_graph=True,
+            retain_graph=True,
+            only_inputs=True,
+        )[0]
+
+        gradients_norm = gradients.view(-1, self.pac * real_data.size(1)).norm(2, dim=1) - 1
+        gradient_penalty = ((gradients_norm) ** 2).mean() * lambda_
+
+        return gradient_penalty
+
+    def forward(self, input_):
+        """Apply the Transformer-based Discriminator to the `input_`."""
+        assert input_.size(0) % self.pac == 0, "Batch size must be divisible by pac"
+        
+        # Reshape input to match the expected input shape for the transformer: (seq_len, batch_size, d_model)
+        # Here, we treat each 'pac' as a sequence of elements, so seq_len = input_.size(0) // self.pac
+        # and batch_size = self.pac (but we keep it as part of the sequence dimension for simplicity in the transformer)
+        # We also need to add a 'feature' dimension of size d_model (transformer_dim)
+        # But since our input_dim might not match d_model, we use a linear layer to project it first
+        # However, since we're using pacdim, we assume input_ has already been projected to the correct dimension
+        # So we just reshape here
+        batch_size_per_pac = input_.size(0) // self.pac
+        input_reshaped = input_.view(batch_size_per_pac, self.pac, self.pacdim).permute(1, 0, 2)  # (pac, batch_size_per_pac, pacdim)
+        
+        # Apply the transformer encoder
+        transformer_output = self.transformer_encoder(input_reshaped)  # (pac, batch_size_per_pac, d_model)
+        
+        # Take the mean along the sequence dimension (pac) to get a fixed-size output for each batch element
+        # Alternatively, you could use pooling or another strategy
+        pooled_output = transformer_output.mean(dim=0)  # (batch_size_per_pac, d_model)
+        
+        # Apply the final neural network
+        final_output = self.final_nn(pooled_output)  # (batch_size_per_pac, 1)
+        
+        # Since we pooled over pac, we need to reshape back to the original batch size for consistency
+        # But since our final output is already (batch_size_per_pac, 1), we can just view it as (input_.size(0) // self.pac, 1)
+        # and then expand it to match the original batch size if needed (but for discrimination, we usually keep it as is)
+        # However, if you need it to match the original input batch size for some reason, you can do:
+        # final_output_expanded = final_output.expand(input_.size(0), -1)  # But this might not be necessary
+        
+        return final_output  # (batch_size_per_pac, 1)
+
+# Example usage:
+# discriminator = TransformerDiscriminator(input_dim=784, transformer_dim=256, num_transformer_layers=3, final_nn_dim=128, pac=10)
+# input_tensor = torch.randn(320, 784)  # Assuming a batch size of 320 and input dimension of 784
+# output = discriminator(input_tensor)
+
+
+self._generator = MultiEncoderGenerator(
+            self._embedding_dim + self._data_sampler.dim_cond_vec(),6,2,self._embedding_dim + self._data_sampler.dim_cond_vec(),2,4*(self._embedding_dim + self._data_sampler.dim_cond_vec()),data_dim, data_dim
+        ).to(self._device)
+
+        discriminator = TransformerDiscriminator(
+            data_dim + self._data_sampler.dim_cond_vec(),data_dim + self._data_sampler.dim_cond_vec(),6,1
+        ).to(self._device)
